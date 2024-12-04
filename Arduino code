@@ -1,0 +1,240 @@
+#define LED_PIN 9
+#define FAN_PIN 10
+#define PUMP_PIN 11
+#define SPRAY_PIN 12
+#define BUTTON_LED 5
+#define BUTTON_FAN 6
+#define BUTTON_PUMP 7
+#define BUTTON_SPRAY 8
+#define BUTTON_MODE 4
+#define BUTTON_MODE2 3 // Nút mới mode2
+
+int mydelay = 0;
+int myvalue = 0;
+int last_CH1_state = 0;  // Trạng thái trước đó của zeroCross
+
+bool ledState = false;
+bool fanState = false;
+bool pumpState = false;
+bool sprayState = false;
+bool modeState = false;
+bool mode2State = false; // Trạng thái cho mode2
+
+unsigned long lastDebounceTimeLED = 0;
+unsigned long lastDebounceTimeFAN = 0;
+unsigned long lastDebounceTimePUMP = 0;
+unsigned long lastDebounceTimeSPRAY = 0;
+unsigned long lastDebounceTimeMODE = 0;
+unsigned long lastDebounceTimeMODE2 = 0; // Biến chống rung cho mode2
+
+const unsigned long debounceDelay = 200; // Độ trễ chống rung
+
+// Định nghĩa chân cảm biến và các thông số
+#define FAN_ACS712_PIN A0       // Chân kết nối tín hiệu từ ACS712 cho FAN
+#define SPRAY_ACS712_PIN A2     // Chân kết nối tín hiệu từ ACS712 cho SPRAY
+#define PUMP_ACS712_PIN A1      // Chân kết nối tín hiệu từ ACS712 cho PUMP
+#define VOLTAGE_REF 5.0         // Điện áp tham chiếu (5V trên Arduino Uno)
+#define ADC_RESOLUTION 1023.0   // Độ phân giải ADC của Arduino (10-bit)
+#define ACS712_SENSITIVITY 0.185 // Độ nhạy của ACS712-05B (185 mV/A)
+const int zeroCross = 2; // Chân đầu vào zero-cross (D2 trên Arduino Nano)
+const int dimmerPin = 13; // Chân điều khiển dimmer (D13 trên Arduino Nano)
+const int potPin = A3;   // Chân đọc giá trị biến trở (A0)
+
+// Biến hiệu chuẩn cảm biến
+float offsetVoltage = 0.0; // Điện áp trung tính (offset)
+
+// Biến thời gian cập nhật dòng điện
+unsigned long lastCurrentUpdateTime = 0;
+const unsigned long currentUpdateInterval = 3000; // Cập nhật dòng mỗi 2 giây
+
+// Biến trạng thái và thời gian gửi dữ liệu
+unsigned long lastSendTimeFan = 0;
+unsigned long lastSendTimeSpray = 0;
+unsigned long lastSendTimePump = 0;
+
+bool fanSentAfterOff = false;
+bool spraySentAfterOff = false;
+bool pumpSentAfterOff = false;
+
+const unsigned long sendIntervalFan = 2000; // Gửi mỗi 2 giây
+const unsigned long sendIntervalSpray = 2000;
+const unsigned long sendIntervalPump = 2000;
+
+void setup() {
+    Serial.begin(115200);
+
+    // Cấu hình chân thiết bị và nút bấm
+    pinMode(zeroCross, INPUT);    // Đầu vào zero-cross
+    pinMode(dimmerPin, OUTPUT);   // Đầu ra dimmer
+    pinMode(potPin, INPUT);       // Đầu vào biến trở
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(FAN_PIN, OUTPUT);
+    pinMode(PUMP_PIN, OUTPUT);
+    pinMode(SPRAY_PIN, OUTPUT);
+
+    pinMode(BUTTON_LED, INPUT_PULLUP);
+    pinMode(BUTTON_FAN, INPUT_PULLUP);
+    pinMode(BUTTON_PUMP, INPUT_PULLUP);
+    pinMode(BUTTON_SPRAY, INPUT_PULLUP);
+    pinMode(BUTTON_MODE, INPUT_PULLUP);
+    pinMode(BUTTON_MODE2, INPUT_PULLUP);
+
+    PCICR |= (1 << PCIE2);        // Bật ngắt pin change cho PCINT[23:16]
+    PCMSK2 |= (1 << PCINT18);     // Bật ngắt riêng cho PCINT18 (D2)
+    // Hiệu chuẩn cảm biến ACS712
+    Serial.println("Calibrating ACS712...");
+    offsetVoltage = calibrateACS712();
+    Serial.print("Offset Voltage: ");
+    Serial.println(offsetVoltage, 3);
+}
+
+void loop() {
+    unsigned long currentMillis = millis();
+
+    // Xử lý nút bấm
+    handleButtonPress(BUTTON_SPRAY, lastDebounceTimeSPRAY, sprayState, SPRAY_PIN, "SPRAY", "ON4", "OFF4");
+    handleButtonPress(BUTTON_LED, lastDebounceTimeLED, ledState, LED_PIN, "LED", "ON3", "OFF3");
+    if (ledState) {
+        // Đọc giá trị từ biến trở và chuyển đổi thành giá trị trễ
+        myvalue = map(analogRead(potPin), 0, 1023, 10000, 10);  
+
+        if (mydelay) { // Nếu có tín hiệu trễ được bật
+            delayMicroseconds(myvalue);  // Tạo độ trễ dựa trên giá trị biến trở
+            digitalWrite(dimmerPin, HIGH);  // Bật dimmer
+            delayMicroseconds(100);         // Giữ trong 100 micro giây
+            digitalWrite(dimmerPin, LOW);   // Tắt dimmer
+            mydelay = 0;  // Tắt tín hiệu trễ
+        }
+    }
+    handleButtonPress(BUTTON_FAN, lastDebounceTimeFAN, fanState, FAN_PIN, "FAN", "ON2", "OFF2");
+    handleButtonPress(BUTTON_PUMP, lastDebounceTimePUMP, pumpState, PUMP_PIN, "PUMP", "ON1", "OFF1");
+    handleButtonPress(BUTTON_MODE, lastDebounceTimeMODE, modeState, -1, "PAGE", "1", "2");
+    handleButtonPress(BUTTON_MODE2, lastDebounceTimeMODE2, mode2State, -1, "MODE", "1", "2");
+
+    // Xử lý lệnh nhận từ ESP32
+    if (Serial.available()) {
+        String command = Serial.readStringUntil('\n');
+        command.trim();
+
+        // Xử lý lệnh điều khiển thiết bị
+        if (command.startsWith("SPRAY:")) {
+            processCommand(command, sprayState, SPRAY_PIN, "SPRAY", "ON4", "OFF4");
+        } else if (command.startsWith("LED:")) {
+            processCommand(command, ledState, LED_PIN, "LED", "ON3", "OFF3");
+        } else if (command.startsWith("FAN:")) {
+            processCommand(command, fanState, FAN_PIN, "FAN", "ON2", "OFF2");
+        } else if (command.startsWith("PUMP:")) {
+            processCommand(command, pumpState, PUMP_PIN, "PUMP", "ON1", "OFF1");
+        } else if (command.startsWith("MODE:")) {
+            if (command.substring(5) == "1") {
+                mode2State = true;
+                Serial.println("MODE:1");
+            } else if (command.substring(5) == "2") {
+                mode2State = false;
+                Serial.println("MODE:2");
+            }
+        }
+    }
+
+    // Cập nhật dòng điện mỗi 2 giây
+    if (currentMillis - lastCurrentUpdateTime >= currentUpdateInterval) {
+        lastCurrentUpdateTime = currentMillis;
+
+        updateCurrentReading(fanState, lastSendTimeFan, fanSentAfterOff, FAN_ACS712_PIN, "FAN");
+        updateCurrentReading(sprayState, lastSendTimeSpray, spraySentAfterOff, SPRAY_ACS712_PIN, "SPRAY");
+        updateCurrentReading(pumpState, lastSendTimePump, pumpSentAfterOff, PUMP_ACS712_PIN, "PUMP");
+    }
+}
+
+// Hàm xử lý nút bấm
+void handleButtonPress(int buttonPin, unsigned long &lastDebounceTime, bool &state, int outputPin, const String &deviceName, const String &onCommand, const String &offCommand) {
+    unsigned long currentMillis = millis();
+    if (digitalRead(buttonPin) == LOW && currentMillis - lastDebounceTime > debounceDelay) {
+        state = !state;
+        if (outputPin >= 0) {
+            digitalWrite(outputPin, state ? HIGH : LOW);
+        }
+        Serial.println(deviceName + ":" + (state ? onCommand : offCommand));
+        lastDebounceTime = currentMillis;
+    }
+}
+
+// Hàm xử lý lệnh điều khiển
+void processCommand(String &command, bool &state, int outputPin, const String &deviceName, const String &onCommand, const String &offCommand) {
+    if (command.endsWith(onCommand)) {
+        state = true;
+        digitalWrite(outputPin, HIGH);
+    } else if (command.endsWith(offCommand)) {
+        state = false;
+        digitalWrite(outputPin, LOW);
+    }
+}
+
+// Hàm cập nhật dòng điện
+void updateCurrentReading(bool state, unsigned long &lastSendTime, bool &sentAfterOff, int sensorPin, const String &deviceName) {
+    unsigned long currentMillis = millis();
+    if (state) {
+        sentAfterOff = false;
+        if (currentMillis - lastSendTime >= sendIntervalFan) {
+            lastSendTime = currentMillis;
+            float voltage = readVoltage(sensorPin);
+            float current = readFilteredCurrent(sensorPin);
+
+            Serial.print(deviceName + "_voltage:");   // In "FAN_voltage:"
+            Serial.print(voltage, 3);                  // In giá trị điện áp
+            Serial.print(",");                         // In dấu phẩy
+            Serial.print(deviceName + "_current:");    // In "FAN_current:"
+            Serial.println(abs(current), 3);           // In giá trị dòng điện và xuống dòng
+
+        }
+    } else if (!sentAfterOff) {
+        sentAfterOff = true;
+        Serial.println(deviceName + "_voltage:0.000," + deviceName + "_current:0.000");
+    }
+}
+
+// Hàm hiệu chuẩn cảm biến ACS712
+float calibrateACS712() {
+    const int numSamples = 1000;
+    long sum = 0;
+      for (int i = 0; i < numSamples; i++) {
+          sum += analogRead(FAN_ACS712_PIN); // Sử dụng chân FAN làm chuẩn
+        delay(1);
+    }
+    float avgReading = sum / numSamples;
+    return avgReading * (VOLTAGE_REF / ADC_RESOLUTION);
+}
+
+// Hàm đọc giá trị điện áp từ chân chỉ định
+float readVoltage(int pin) {
+    int sensorValue = analogRead(pin);
+    return sensorValue * (VOLTAGE_REF / ADC_RESOLUTION);
+}
+
+// Hàm đọc giá trị dòng điện từ chân chỉ định với bộ lọc
+float readFilteredCurrent(int pin) {
+    const int numSamples = 50; // Lấy trung bình trên 50 lần đọc
+    float sum = 0.0;
+    for (int i = 0; i < numSamples; i++) {
+        float voltage = analogRead(pin) * (VOLTAGE_REF / ADC_RESOLUTION);
+        float current = (voltage - offsetVoltage) / ACS712_SENSITIVITY;
+        sum += current;
+
+        delay(1);
+    }
+    return sum / numSamples; // Trả về giá trị trung bình
+}
+// Ngắt PCINT2_vect (kích hoạt khi có thay đổi ở D2)
+ISR(PCINT2_vect) {
+    // Kiểm tra tín hiệu zero-cross
+    if (digitalRead(zeroCross) == HIGH) {  // Phát hiện cạnh lên
+        if (last_CH1_state == LOW) { // Nếu cạnh xuống vừa xảy ra
+            mydelay = 1;  // Bật tín hiệu trễ
+        }
+    } else if (last_CH1_state == HIGH) { // Phát hiện cạnh xuống
+        mydelay = 1;  // Bật tín hiệu trễ
+    }
+
+    // Cập nhật trạng thái trước đó
+    last_CH1_state = digitalRead(zeroCross);  
+}
