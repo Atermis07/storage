@@ -1,0 +1,633 @@
+#include <WiFi.h>
+#include <HTTPClient.h> // Thư viện HTTPClient để gửi dữ liệu HTTP
+#include <PubSubClient.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <BH1750.h>
+#include <HardwareSerial.h>
+#include <Ticker.h>  // Thư viện Ticker để sử dụng bộ hẹn giờ
+
+#define RX_PIN 16  // Chân RX được đặt là GPIO 16
+#define TX_PIN 17  // Chân TX được đặt là GPIO 17
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+DHT dht(4, DHT11);
+BH1750 lightMeter;
+WiFiClient espClient;
+PubSubClient client(espClient);
+Ticker arduinoDataTicker;  // Đối tượng Ticker cho bộ hẹn giờ
+Ticker publishDataTimer;
+
+// Định nghĩa chân cho HC-SR04
+#define TRIGGER_PIN 14  // Chân Trigger mới
+#define ECHO_PIN 27     // Chân Echo mới
+#define MAX_DISTANCE_CM 24  // Khoảng cách tối đa là 40 cm
+
+// Khai báo chân cho cảm biến độ ẩm đất
+const int analogPin = 34;  // Chân kết nối cảm biến độ ẩm đất
+const int dryValue = 4095; // Giá trị khi đất khô
+const int wetValue = 1700; // Giá trị khi đất ướt
+
+const char* ssid = "Thinh";
+const char* password = "thinh12345";
+const char* serverUrl = "http://nettrom.atwebpages.com/save_sensor_data.php"; // Địa chỉ của file PHP trên web hosting
+const char* mqtt_broker = "broker.emqx.io";
+const char* mqtt_username = "Thinh1007";
+const char* mqtt_password = "123456";
+const int mqtt_port = 1883;
+
+const float LUX_THRESHOLD = 5.0;
+bool autoMode = false; // tắt chế độ tự động
+bool isPageTwo = false;
+bool wifiConnected = false; // Trạng thái WiFi
+bool displayNeedsUpdate = false;  // Biến đánh dấu khi cần cập nhật màn hình
+String ledStatus = "OFF3";
+String fanStatus = "OFF2";
+String pumpStatus = "OFF1";
+String sprayStatus = "OFF4";
+bool dataReceived = false; // Biến kiểm tra xem có dữ liệu từ Arduino không
+String pageStatus = "1"; // Biến lưu trạng thái trang từ Arduino
+char msg[50];
+
+// Biến lưu trữ giá trị điện áp và dòng điện
+float fanVoltage = 0.0;
+float fanCurrent = 0.0;
+float pumpVoltage = 0.0;
+float pumpCurrent = 0.0;
+float sprayVoltage = 0.0;
+float sprayCurrent = 0.0;
+
+void setup() {
+  Serial.begin(115200);                      // Giao tiếp với máy tính qua Serial
+  Serial1.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN); // Giao tiếp với Arduino qua Serial1
+
+  connectToWiFi();
+  client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  dht.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print(F("Khoi tao thanh cong"));
+  display.display();
+  delay(2000);
+
+  if (lightMeter.begin()) {
+    Serial.println("BH1750 is started successfully.");
+  } else {
+    Serial.println("Error initializing BH1750!");
+    while (1) {}  // Dừng nếu không thể khởi động cảm biến
+  }
+  isPageTwo = true;
+
+  // Khởi tạo chân cho HC-SR04
+  pinMode(TRIGGER_PIN, OUTPUT); // Đặt chân trigger là OUTPUT
+  pinMode(ECHO_PIN, INPUT);     // Đặt chân echo là INPUT
+
+  // Không cần thiết lập chân cho cảm biến độ ẩm đất vì analogRead không yêu cầu
+
+  arduinoDataTicker.attach(1.0, readDataFromArduino);// Gọi hàm đọc dữ liệu từ Arduino mỗi 1 giây
+  publishDataTimer.attach(5.0, publishSensorData); // Gọi hàm gửi dữ liệu cảm biến mỗi 5 giây
+  updateDisplay();
+}
+
+void connectToWiFi() {
+  if (!wifiConnected) {
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.println("Connecting to WiFi...");
+
+      // Đọc dữ liệu từ Arduino và cập nhật màn hình
+      readDataFromArduino();
+      if (displayNeedsUpdate) {
+        updateDisplay();
+        displayNeedsUpdate = false;
+      }
+    }
+    wifiConnected = true;
+    Serial.println("Connected to WiFi.");
+  }
+}
+
+void reconnectMQTT() {
+  if (wifiConnected && !client.connected()) {  // Chỉ kết nối MQTT nếu WiFi đã kết nối
+    String client_id = "ESP32Client-";
+    client_id += String(WiFi.macAddress());
+    if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
+      client.subscribe("nhietdo_DHT22");
+      client.subscribe("doam_DHT22");
+      client.subscribe("maybom_control");
+      client.subscribe("quat_control");
+      client.subscribe("doamdat_sensor");
+      client.subscribe("den_control");
+      client.subscribe("voiphun_control");
+      client.subscribe("running-mode");
+      client.subscribe("dosang");
+      client.subscribe("khoangcach_untra"); // Đăng ký topic mới cho khoảng cách nếu cần
+      client.subscribe("dong_Quat");
+      client.subscribe("dong_Maybom");
+      client.subscribe("dong_Voiphun");
+      Serial.println("MQTT connected.");
+    } else {
+      delay(2000);  // Đợi trước khi thử lại
+    }
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String incomingMessage = "";
+  for (int i = 0; i < length; i++) {
+    incomingMessage += (char)payload[i];
+  }
+
+  // Xử lý từng topic
+  if (String(topic) == "voiphun_control") {
+    if (incomingMessage == "ON4") {
+      Serial1.println("SPRAY:ON4");  // Gửi lệnh bật spray sang Arduino
+      sprayStatus = "ON4";
+      Serial.println("Spray status: " + sprayStatus);
+    } else if (incomingMessage == "OFF4") {
+      Serial1.println("SPRAY:OFF4"); // Gửi lệnh tắt spray sang Arduino
+      sprayStatus = "OFF4";
+      Serial.println("Spray status: " + sprayStatus);
+    }
+    displayNeedsUpdate = true;
+  } else if (String(topic) == "den_control") {
+    if (incomingMessage == "ON3") {
+      Serial1.println("LED:ON3"); // Gửi lệnh bật LED sang Arduino
+      ledStatus = "ON3";
+      Serial.println("LED status: " + ledStatus); // Kiểm tra trạng thái LED
+    } else if (incomingMessage == "OFF3") {
+      Serial1.println("LED:OFF3"); // Gửi lệnh tắt LED sang Arduino
+      ledStatus = "OFF3";
+      Serial.println("LED status: " + ledStatus); // Kiểm tra trạng thái LED
+    }
+    displayNeedsUpdate = true;
+  } else if (String(topic) == "quat_control") {
+    if (incomingMessage == "ON2") {
+      Serial1.println("FAN:ON2"); // Gửi lệnh bật quạt sang Arduino
+      fanStatus = "ON2";
+      Serial.println("Fan status: " + fanStatus); // Kiểm tra trạng thái quạt
+    } else if (incomingMessage == "OFF2") {
+      Serial1.println("FAN:OFF2"); // Gửi lệnh tắt quạt sang Arduino
+      fanStatus = "OFF2";
+      Serial.println("Fan status: " + fanStatus); // Kiểm tra trạng thái quạt
+    }
+    displayNeedsUpdate = true;
+  } else if (String(topic) == "maybom_control") {
+    if (incomingMessage == "ON1" && pumpStatus != "ON1") {
+      Serial1.println("PUMP:ON1"); // Gửi lệnh bật máy bơm sang Arduino
+      pumpStatus = "ON1";
+      Serial.println("Pump status: " + pumpStatus); // Kiểm tra trạng thái máy bơm
+    } else if (incomingMessage == "OFF1" && pumpStatus != "OFF1" ) {
+      Serial1.println("PUMP:OFF1"); // Gửi lệnh tắt máy bơm sang Arduino
+      pumpStatus = "OFF1";
+      Serial.println("Pump status: " + pumpStatus); // Kiểm tra trạng thái máy bơm
+    }
+    displayNeedsUpdate = true;
+  }
+     else if (String(topic) == "running-mode") {
+  // Chỉ cập nhật chế độ khi có sự thay đổi thực sự
+  if (incomingMessage == "MODE: 1" && autoMode != false) {
+    autoMode = false;
+    Serial.println("Chế độ Manual được kích hoạt qua MQTT");
+    Serial1.println("MODE:1"); // Gửi lệnh sang Arduino
+    updateModeAndDevices();
+  } else if (incomingMessage == "MODE: 2" && autoMode != true) {
+    autoMode = true;
+    Serial.println("Chế độ Auto được kích hoạt qua MQTT");
+    Serial1.println("MODE:2"); // Gửi lệnh sang Arduino
+    updateModeAndDevices();
+  }
+  displayNeedsUpdate = true;
+}
+}
+
+bool previousAutoMode = false; // Lưu trạng thái trước đó của chế độ Auto
+void updateModeAndDevices() {
+    if (autoMode == previousAutoMode) {
+        // Nếu chế độ chưa thay đổi, không làm gì cả
+        Serial.println("No mode change detected.");
+        return;
+    }
+
+    previousAutoMode = autoMode; // Cập nhật chế độ trước đó
+
+    // Điều khiển thiết bị theo chế độ mới
+    if (!autoMode) {
+        Serial.println("Manual mode activated");
+        Serial1.println("MODE:1"); // Gửi lệnh chế độ Manual
+    } else {
+        Serial.println("Auto mode activated");
+        Serial1.println("MODE:2"); // Gửi lệnh chế độ Auto
+    }
+
+    // Chỉ gửi lệnh điều khiển thiết bị nếu chế độ thay đổi
+    if (autoMode != previousAutoMode) {
+        // Tắt các thiết bị trong chế độ Manual
+        Serial1.println("LED:OFF3");
+        ledStatus = "OFF3";
+        client.publish("den_control", ledStatus.c_str());
+
+        Serial1.println("FAN:OFF2");
+        fanStatus = "OFF2";
+        client.publish("quat_control", fanStatus.c_str());
+
+        Serial1.println("PUMP:OFF1");
+        pumpStatus = "OFF1";
+        client.publish("maybom_control", pumpStatus.c_str());
+
+        Serial1.println("SPRAY:OFF4");
+        sprayStatus = "OFF4";
+        client.publish("voiphun_control", sprayStatus.c_str());
+
+        displayNeedsUpdate = true;
+        Serial.println("Devices updated according to new mode.");
+    }
+}
+
+
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;  // Cập nhật lại trạng thái nếu mất WiFi
+    connectToWiFi();        // Thử kết nối lại WiFi
+  } else {
+    wifiConnected = true;   // Cập nhật lại trạng thái nếu WiFi được kết nối
+  }
+
+  reconnectMQTT();            // Kiểm tra kết nối MQTT nếu WiFi ổn định
+  client.loop();              // Duy trì kết nối MQTT nếu đã kết nối
+  readDataFromArduino();
+
+  // Chỉ cập nhật màn hình khi có thay đổi
+  if (displayNeedsUpdate) {
+    updateDisplay();
+    displayNeedsUpdate = false;  // Đặt lại cờ sau khi cập nhật xong
+  }
+}
+
+void readDataFromArduino() {
+  dataReceived = false;
+  bool pageChangeDetected = false;  // Biến tạm để theo dõi thay đổi trang
+
+  while (Serial1.available()) {
+    String receivedData = Serial1.readStringUntil('\n');
+    receivedData.trim();
+
+    if (receivedData == "PAGE:1") {
+      if (isPageTwo) { // Chỉ thay đổi nếu đang ở Page 2
+        pageChangeDetected = true;
+        isPageTwo = false;
+      }
+      displayNeedsUpdate = true;
+    } else if (receivedData == "PAGE:2") {
+      if (!isPageTwo) { // Chỉ thay đổi nếu đang ở Page 1
+        pageChangeDetected = true;
+        isPageTwo = true;
+      }
+      displayNeedsUpdate = true;
+    } else if (receivedData.startsWith("MODE:")) {
+      String modeValue = receivedData.substring(5); // Lấy giá trị sau "MODE:"
+      String Mode = "MODE: " + modeValue;
+      if (modeValue == "1") {
+        autoMode = false;
+        Serial.println("Chế độ Manual được kích hoạt");
+        client.publish("running-mode", Mode.c_str());
+        updateModeAndDevices();
+      } else if (modeValue == "2") {
+        autoMode = true;
+        Serial.println("Chế độ Auto được kích hoạt");
+        client.publish("running-mode", Mode.c_str());
+        updateModeAndDevices();
+      }
+      displayNeedsUpdate = true;
+    } else if (receivedData.startsWith("LED:")) {
+      ledStatus = receivedData.substring(4); // Lấy phần sau "LED:"
+      dataReceived = true;
+      client.publish("den_control", ledStatus.c_str());
+      displayNeedsUpdate = true;
+    } else if (receivedData.startsWith("FAN:")) {
+      fanStatus = receivedData.substring(4); // Lấy phần sau "FAN:"
+      dataReceived = true;
+      client.publish("quat_control", fanStatus.c_str());
+      displayNeedsUpdate = true;
+    } else if (receivedData.startsWith("PUMP:")) {
+      pumpStatus = receivedData.substring(5); // Lấy phần sau "PUMP:"
+      dataReceived = true;
+      client.publish("maybom_control", pumpStatus.c_str());
+      displayNeedsUpdate = true;
+    } else if (receivedData.startsWith("SPRAY:")) {
+      sprayStatus = receivedData.substring(6); // Lấy phần sau "SPRAY:"
+      dataReceived = true;
+      client.publish("voiphun_control", sprayStatus.c_str());
+      displayNeedsUpdate = true;
+    } else if (receivedData.startsWith("FAN_voltage:")) {
+      parseVoltageCurrent(receivedData, "FAN");
+    } else if (receivedData.startsWith("PUMP_voltage:")) {
+      parseVoltageCurrent(receivedData, "PUMP");
+    } else if (receivedData.startsWith("SPRAY_voltage:")) {
+      parseVoltageCurrent(receivedData, "SPRAY");
+    }
+  }
+}
+
+void parseVoltageCurrent(String receivedData, String device) {
+  // Tìm vị trí của dấu hai chấm và dấu phẩy
+  int indexVoltageColon = receivedData.indexOf(':');
+  int indexComma = receivedData.indexOf(',');
+  int indexCurrentColon = receivedData.indexOf(':', indexComma);
+
+  // Kiểm tra tính hợp lệ của chuỗi
+  if (indexVoltageColon == -1 || indexComma == -1 || indexCurrentColon == -1) {
+    Serial.println("Invalid voltage/current data format");
+    return;
+  }
+
+  // Lấy giá trị điện áp và dòng điện dưới dạng chuỗi
+  String voltageStr = receivedData.substring(indexVoltageColon + 1, indexComma);
+  String currentStr = receivedData.substring(indexCurrentColon + 1);
+
+  // Chuyển đổi sang số thực
+  float voltage = voltageStr.toFloat();
+  float current = currentStr.toFloat();
+
+  // Cập nhật biến tương ứng và gửi lên MQTT theo định dạng yêu cầu
+  if (device == "FAN") {
+    fanVoltage = voltage;
+    fanCurrent = current;
+    // Tạo chuỗi dữ liệu cho FAN
+    String fanPayload = "FAN_voltage:" + String(fanVoltage, 3) + ",FAN_current:" + String(fanCurrent, 3);
+    // Publish lên topic "dong_Quat"
+    client.publish("dong_Quat", fanPayload.c_str());
+  } else if (device == "PUMP") {
+    pumpVoltage = voltage;
+    pumpCurrent = current;
+    // Tạo chuỗi dữ liệu cho PUMP
+    String pumpPayload = "PUMP_voltage:" + String(pumpVoltage, 3) + ",PUMP_current:" + String(pumpCurrent, 3);
+    // Publish lên topic "dong_Maybom"
+    client.publish("dong_Maybom", pumpPayload.c_str());
+  } else if (device == "SPRAY") {
+    sprayVoltage = voltage;
+    sprayCurrent = current;
+    // Tạo chuỗi dữ liệu cho SPRAY
+    String sprayPayload = "SPRAY_voltage:" + String(sprayVoltage, 3) + ",SPRAY_current:" + String(sprayCurrent, 3);
+    // Publish lên topic "dong_Voiphun"
+    client.publish("dong_Voiphun", sprayPayload.c_str());
+  }
+
+  displayNeedsUpdate = true; // Cập nhật trạng thái hiển thị nếu cần
+}
+
+
+float readMoisture() {
+  int analogValue = analogRead(analogPin);
+  float moisturePercent = map(analogValue, dryValue, wetValue, 0, 100);
+  moisturePercent = constrain(moisturePercent, 0, 100);
+  return moisturePercent;
+}
+
+void publishSensorData() {
+  float temp = dht.readTemperature();
+  float humid = dht.readHumidity();
+  float lux = lightMeter.readLightLevel();
+  float waterLevel = 0.0;    // Giả sử cảm biến không có thì giá trị sẽ là 0
+
+  // Đọc giá trị độ ẩm đất
+  float soilMoisture = readMoisture();
+
+  // Đọc giá trị từ cảm biến HC-SR04
+  float distance_cm = readUltrasonicDistance();
+
+  // Chuyển đổi khoảng cách thành tỷ lệ phần trăm (0% tại 40 cm, 100% tại 0 cm)
+  float distance_percentage = ((MAX_DISTANCE_CM - distance_cm) / MAX_DISTANCE_CM) * 100.0;
+  if (distance_percentage > 100.0) {
+    distance_percentage = 100.0; // Giới hạn tối đa là 100%
+  } else if (distance_percentage < 0.0) {
+    distance_percentage = 0.0;   // Giới hạn tối thiểu là 0%
+  }
+
+  // Điều khiển thiết bị dựa trên giá trị cảm biến nếu ở chế độ Auto
+  if (autoMode) {
+    // Điều khiển quạt dựa trên nhiệt độ
+    if (temp >= 31.0) {
+      if (fanStatus != "ON2") {
+        Serial1.println("FAN:ON2");
+        fanStatus = "ON2";
+        client.publish("quat_control", fanStatus.c_str());
+        displayNeedsUpdate = true;
+      }
+    } else if( temp <= 29) {
+      if (fanStatus != "OFF2") {
+        Serial1.println("FAN:OFF2");
+        fanStatus = "OFF2";
+        client.publish("quat_control", fanStatus.c_str());
+        displayNeedsUpdate = true;
+      }
+    }
+
+    // Điều khiển máy bơm dựa trên mực nước
+    if (distance_percentage < 30.0) {
+      if (pumpStatus != "ON1") {
+        Serial1.println("PUMP:ON1");
+        pumpStatus = "ON1";
+        client.publish("maybom_control", pumpStatus.c_str());
+        displayNeedsUpdate = true;
+      }
+    } else if (distance_percentage >= 60.0) {
+      if (pumpStatus != "OFF1") {
+        Serial1.println("PUMP:OFF1");
+        pumpStatus = "OFF1";
+        client.publish("maybom_control", pumpStatus.c_str());
+        displayNeedsUpdate = true;
+      }
+    }
+
+    // Điều khiển vòi phun dựa trên độ ẩm không khí và độ ẩm đất
+    if (humid < 50.0 || soilMoisture < 40.0 ) {
+      if (sprayStatus != "ON4") {
+        Serial1.println("SPRAY:ON4");
+        sprayStatus = "ON4";
+        client.publish("voiphun_control", sprayStatus.c_str());
+        displayNeedsUpdate = true;
+      }
+    } else {
+      if (sprayStatus != "OFF4") {
+        Serial1.println("SPRAY:OFF4");
+        sprayStatus = "OFF4";
+        client.publish("voiphun_control", sprayStatus.c_str());
+        displayNeedsUpdate = true;
+      }
+    }
+
+    // Điều khiển đèn dựa trên giá trị lux
+    if (lux < 25.0) {
+      if (ledStatus != "ON3") {
+        Serial1.println("LED:ON3");
+        ledStatus = "ON3";
+        client.publish("den_control", ledStatus.c_str());
+        displayNeedsUpdate = true;
+      }
+    } else {
+      if (ledStatus != "OFF3") {
+        Serial1.println("LED:OFF3");
+        ledStatus = "OFF3";
+        client.publish("den_control", ledStatus.c_str());
+        displayNeedsUpdate = true;
+      }
+    }
+  }
+
+  // Gửi dữ liệu lên server qua HTTP POST
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    String postData = "temperature=" + String(temp, 2) +
+                      "&humidity=" + String(humid, 2) +
+                      "&lux=" + String(lux, 2) +
+                      "&water_level=" + String(distance_percentage, 2) +
+                      "&soil_moisture=" + String(soilMoisture, 2);
+
+    int httpResponseCode = http.POST(postData);
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("HTTP Response: " + response);
+    } else {
+      Serial.println("Error in HTTP request");
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi Disconnected");
+  }
+
+  // Gửi dữ liệu qua MQTT
+  String distanceMessage = "Khoảng cách: " + String(distance_percentage, 2) + " %";
+  String temperature = "temperature: " + String(temp, 2);
+  String humidityMessage = "humidity: " + String(humid, 2);
+  String luxValue = "lux: " + String(lux, 2);
+  String soilMoistureMessage = "Độ ẩm đất: " + String(soilMoisture, 2) + " %";
+
+  client.publish("nhietdo_DHT22", temperature.c_str());
+  client.publish("doam_DHT22", humidityMessage.c_str());
+  client.publish("dosang", luxValue.c_str());
+  client.publish("khoangcach_untra", distanceMessage.c_str()); // Gửi khoảng cách với định dạng yêu cầu
+  client.publish("doamdat_sensor", soilMoistureMessage.c_str()); // Gửi độ ẩm đất với định dạng "Độ ẩm đất: 0.00 %"
+
+  // Cập nhật màn hình nếu đang ở trang 1
+  if (!isPageTwo) {
+    displayNeedsUpdate = true;
+  }
+}
+
+void updateDisplay() {
+  if (isPageTwo) {
+    updateDeviceStatusDisplay();  // Hiển thị trạng thái thiết bị nếu là trang 2
+  } else {
+    float temp = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    float lux = lightMeter.readLightLevel();
+
+    // Đọc giá trị từ cảm biến HC-SR04
+    float distance_cm = readUltrasonicDistance();
+
+    // Chuyển đổi khoảng cách thành tỷ lệ phần trăm (0% tại 40 cm, 100% tại 0 cm)
+    float distance_percentage = ((MAX_DISTANCE_CM - distance_cm) / MAX_DISTANCE_CM) * 100.0;
+    if (distance_percentage > 100.0) {
+      distance_percentage = 100.0; // Giới hạn tối đa là 100%
+    } else if (distance_percentage < 0.0) {
+      distance_percentage = 0.0;   // Giới hạn tối thiểu là 0%
+    }
+
+    // Đọc giá trị độ ẩm đất
+    float soilMoisture = readMoisture();
+
+    updateSensorDisplay(temp, humidity, lux, distance_percentage, soilMoisture);  // Hiển thị dữ liệu cảm biến nếu là trang 1
+  }
+  display.display();  // Thực sự hiển thị lên màn hình
+}
+
+float readUltrasonicDistance() {
+  // Xóa chân trigger
+  digitalWrite(TRIGGER_PIN, LOW);
+  delayMicroseconds(2);
+
+  // Gửi xung 10us để kích hoạt cảm biến
+  digitalWrite(TRIGGER_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIGGER_PIN, LOW);
+
+  // Đo thời gian tín hiệu echo ở mức HIGH
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // Thời gian chờ tối đa 30ms để tránh treo
+
+  // Tính khoảng cách theo công thức
+  float distance_cm = (duration / 2.0) * 0.0343;
+
+  // Kiểm tra nếu giá trị không hợp lệ
+  if (duration == 0 || distance_cm > MAX_DISTANCE_CM) {
+    distance_cm = MAX_DISTANCE_CM; // Đặt giá trị tối đa nếu không đọc được hoặc vượt quá
+  }
+
+  return distance_cm;
+}
+
+void updateSensorDisplay(float temp, float humidity, float lux, float distance_percentage, float soilMoisture) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Mode: ");
+  display.print(autoMode ? "Auto" : "Manual");
+  display.setCursor(0, 10);
+  display.print("Temp: ");
+  display.print(temp, 2); // Hiển thị với 2 chữ số thập phân
+  display.print(" C");
+  display.setCursor(0, 20);
+  display.print("Humidity: ");
+  display.print(humidity, 2); // Hiển thị với 2 chữ số thập phân
+  display.print("%");
+  display.setCursor(0, 30);
+  display.print("Trang thai: ");
+  display.print((lux > LUX_THRESHOLD) ? "Sang" : "Toi");
+  display.setCursor(0, 40);
+  display.print("Soil Moist: ");
+  display.print(soilMoisture, 2); // Hiển thị với 2 chữ số thập phân
+  display.print("%");
+  display.setCursor(0, 50);
+  display.print("Water Lvl: ");
+  display.print(distance_percentage, 2); // Hiển thị với 2 chữ số thập phân
+  display.print("%");
+}
+
+void updateDeviceStatusDisplay() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Device Status");
+
+  display.setCursor(0, 10);
+  display.print("Mode: ");
+  display.print(autoMode ? "Auto" : "Manual");
+
+  display.setCursor(0, 20);
+  display.print("Den AC: ");
+  display.print(ledStatus);
+
+  display.setCursor(0, 30);
+  display.print("FAN: ");
+  display.print(fanStatus);
+
+  display.setCursor(0, 40);
+  display.print("PUMP: ");
+  display.print(pumpStatus);
+
+  display.setCursor(0, 50);
+  display.print("SPRAY: "); 
+  display.print(sprayStatus);
+}
